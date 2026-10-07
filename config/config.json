@@ -1,0 +1,20 @@
+{
+  "mount": {
+    "path": "S:\\"
+  },
+  "rclone": {
+    "executable": "rclone.exe",
+    "remote": "s3:local-sync-folder-reclone",
+    "rc": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 5572
+    }
+  },
+  "status": {
+    "state_file": "%LOCALAPPDATA%\\RcloneExplorerStatus\\state.json"
+  },
+  "logging": {
+    "level": "info"
+  }
+}

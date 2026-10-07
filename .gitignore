@@ -1,0 +1,8 @@
+*.exe
+*.dll
+*.ico
+*.tmp
+state.json
+*.log
+/.idea/
+/.vscode/
