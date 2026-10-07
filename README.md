@@ -1,134 +1,139 @@
 # Rclone Explorer Sync Status
 
-This repository contains a native Windows Explorer overlay handler, a Go status service, and an installer that lets the user select the local rclone mount directory.
+Native Windows Explorer overlay icons and a background status service for files managed by **rclone**. Explorer stays the UI; rclone stays the sync engine. This app only presents state.
 
 ## What is included
 
-- configurable application settings
-- file status model and state transitions
-- JSON-based state store with atomic writes and corruption handling
-- status-to-overlay mapping for synced, syncing, and error
-- GUI mount-folder selection during installation
-- native 64-bit `IShellIconOverlayIdentifier` COM handlers for synced, syncing, and error
-- Explorer refresh notification after a file status changes
-- hidden background monitor polling rclone's RC stats, VFS upload queue, and completed transfers
-- current-user logon startup registration for the monitor
-- installation and uninstallation scripts
-- test coverage for normalization, transitions, and persistence
+- configurable mount / rclone / RC settings
+- JSON status store with atomic writes and corruption recovery
+- Explorer overlays for **synced**, **syncing**, and **error**
+- hidden monitor that polls rclone RC (`core/stats`, `vfs/queue`, `core/transferred`)
+- inventory **audit** / **remaining** / **resync** via rclone (`lsjson` / `copyto`) — never a direct S3 client
+- installer that validates prerequisites (Windows, Go, VS C++ tools, rclone, icons)
+- optional short CLI on PATH: **`rcs`**
+- Start Menu app, Explorer right-click Sync / Audit
+- install / uninstall scripts
 
-The overlay handler reads exact file-state records from the local status store. The monitor reads rclone's RC endpoints and updates those records while running. Rclone must be restarted with RC enabled as shown below; the installer cannot turn RC on inside an already-running rclone process.
+## Quick start
 
-## Status model
-
-The current implementation supports the PRD-required core states:
-
-- `unknown`
-- `pending`
-- `syncing`
-- `synced`
-- `error`
-- `conflict`
-- `offline`
-- `cloud_only`
-
-The active Explorer overlay proof is built around the first-release minimum:
-
-- `synced`
-- `syncing`
-- `error`
-
-## Usage
-
-### 1. Build the project
-
-```bash
-go test ./...
-go build ./...
-```
-
-### 2. Install on Windows
-
-From the repo root:
+### Install
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The installer opens the mount picker before requesting administrator permission so per-user mapped drives such as `S:\` are visible. It then builds the binaries and COM DLL, registers the shell handler, and starts the hidden monitor. Restart Windows Explorer after installation to reload shell handlers.
+The installer asks for:
 
-To open the folder picker directly after building:
+1. **rclone** (offers winget install or opens the download page if missing)
+2. whether to add **`rcs`** to your user PATH
+3. the local rclone mount folder (for example `S:\`)
 
-```powershell
-go run .\cmd\installer
-```
+It then builds binaries + the overlay DLL, registers COM handlers, Start Menu shortcuts, and context menus, and starts the background monitor.
 
-### 3. Run the service
+Restart Windows Explorer after install. Open a **new** terminal so PATH picks up `rcs`.
 
-```powershell
-& "$env:ProgramFiles\RcloneExplorerStatus\bin\rclone-explorer-status.exe"
-```
+### Enable automatic overlays
 
-If installation used the per-user fallback, run `%LOCALAPPDATA%\RcloneExplorerStatus\bin\rclone-explorer-status.exe` instead.
-
-The installer also starts a hidden monitor immediately and registers it to run at your next sign-in.
-
-### 4. Enable automatic rclone status updates
-
-Stop the currently running rclone mount, then restart it with the loopback-only RC listener. Example for this configured remote and mount:
+Remount rclone with loopback RC (required for live status):
 
 ```powershell
 rclone mount s3:local-sync-folder-reclone S:\ --vfs-cache-mode full --links --rc --rc-addr 127.0.0.1:5572 --rc-no-auth
 ```
 
-Keep RC bound to `127.0.0.1`; the RC API can control rclone and must not be exposed to the network. `--rc-no-auth` is used here only with that loopback bind. The monitor polls VFS queue and transfer endpoints and updates file states automatically.
+Keep RC on `127.0.0.1` only.
 
-### 5. Check status
+### Everyday commands (`rcs`)
 
-```powershell
-"$env:LOCALAPPDATA\RcloneExplorerStatus\bin\rclone-explorer-status.exe" status
+```bash
+rcs status
+rcs doctor
+rcs remaining
+rcs remaining "S:/courses"
+rcs remaining "S:/courses" --items
+rcs audit "S:/courses"
+rcs resync "S:/courses"
+rcs resync "S:/path/to/file.mp4"
+rcs logs --follow
+rcs set "S:/path/to/file.txt" synced
 ```
 
-### 6. Run the doctor check
+| Command | Purpose |
+|---------|---------|
+| `remaining` | Folders + items still missing on the remote (add `--items` to list files) |
+| `audit` | Compare mount vs remote, update Explorer overlays |
+| `resync` | Upload missing local files (or one file) via rclone |
+| `doctor` | Health checks (mount, state, rclone, RC) |
+| `set` | Manually set overlay state for a file |
 
-```powershell
-"$env:LOCALAPPDATA\RcloneExplorerStatus\bin\rclone-explorer-status.exe" doctor
-```
+### Explorer integration
 
-### 7. View logs
+- Right-click a **file** under the mount → **Sync with Rclone Explorer Status**
+- Right-click a **folder** → **Audit folder with Rclone Explorer Status**
+- Start Menu → **Rclone Explorer Status** (status panel)
 
-```powershell
-& "$env:ProgramFiles\RcloneExplorerStatus\bin\rclone-explorer-status.exe" logs
-& "$env:ProgramFiles\RcloneExplorerStatus\bin\rclone-explorer-status.exe" logs --follow
-Get-Content "$env:LOCALAPPDATA\RcloneExplorerStatus\logs\install.log" -Tail 50
-```
+## Status model
 
-`logs --follow` prints the last 50 application entries, then streams new entries until Ctrl+C. The service also writes each entry immediately to `service.log`; the PowerShell installer streams elevated progress into `install.log` and the invoking terminal.
+Supported states: `unknown`, `pending`, `syncing`, `synced`, `error`, `conflict`, `offline`, `cloud_only`.
 
-### 8. Show a test overlay
+First-release overlays:
 
-Choose an existing file under the selected mount and set its state:
+| State | Overlay |
+|-------|---------|
+| synced | green check |
+| syncing / pending | blue arrows |
+| error / conflict | red X |
 
-```powershell
-& "$env:ProgramFiles\RcloneExplorerStatus\bin\rclone-explorer-status.exe" set "S:\path\to\file.txt" synced
-```
-
-Use `syncing` or `error` for the other overlays. The command saves the status and notifies Explorer to refresh that file. Automatic updates still require rclone RC to be enabled.
-
-## Installation details
-
-See [INSTALLATION.md](INSTALLATION.md) for the full Windows installation and verification guide.
-
-## Current build
+## Build from source
 
 ```bash
 go test ./...
 go build ./...
 ```
 
-## Logging
+Manual binaries:
 
-The application writes structured logs to `%LOCALAPPDATA%\RcloneExplorerStatus\logs\service.log` and the installer writes `%LOCALAPPDATA%\RcloneExplorerStatus\logs\install.log`.
+```powershell
+New-Item -ItemType Directory -Force .\bin | Out-Null
+go build -o .\bin\rclone-explorer-status.exe .\cmd\service
+go build -ldflags '-H=windowsgui' -o .\bin\rclone-explorer-status-monitor.exe .\cmd\service
+go build -ldflags '-H=windowsgui' -o .\bin\rclone-explorer-status-shell.exe .\cmd\shellhelper
+go build -ldflags '-H=windowsgui' -o .\bin\rclone-explorer-status-app.exe .\cmd\app
+python .\scripts\generate_icons.py
+```
+
+## Install locations
+
+| What | Path |
+|------|------|
+| App (machine) | `%ProgramFiles%\RcloneExplorerStatus` |
+| App (user fallback) | `%LOCALAPPDATA%\RcloneExplorerStatus` |
+| Config | `%APPDATA%\RcloneExplorerStatus\config.json` |
+| State | `%LOCALAPPDATA%\RcloneExplorerStatus\state.json` |
+| Logs | `%LOCALAPPDATA%\RcloneExplorerStatus\logs\` |
+
+## Uninstall
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
+```
+
+Removes COM handlers, binaries, context menus, Start Menu entries, and the `rcs` PATH entry. Config, state, and logs are preserved.
+
+## Architecture rule
+
+```text
+Explorer ← overlays ← Go status store ← rclone RC / lsjson / copyto ← S3
+```
+
+The Go app never talks to S3 directly and never stores AWS credentials.
+
+## More detail
+
+See [INSTALLATION.md](INSTALLATION.md) for prerequisites, Build Tools troubleshooting, and verification steps.
 
 ## Requirements and limitations
 
-Automatic updates require the mounted rclone process to expose RC on `127.0.0.1:5572`; this app cannot enable RC inside an already-running mount. The hidden monitor polls the VFS upload queue and transfer results, and starts at future user sign-ins. Restart the rclone mount with loopback RC enabled and restart Windows Explorer after installation. Other sync applications compete for Windows' limited overlay-handler slots.
+- Windows 10/11 amd64
+- Automatic live overlays need rclone RC on `127.0.0.1:5572`
+- Windows has a limited number of overlay handler slots (other sync clients may compete)
+- Overlay icons are corner badges that scale with Explorer icon size

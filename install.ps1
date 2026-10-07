@@ -1,6 +1,7 @@
 param(
     [string]$MountPath,
-    [string]$MountPathBase64
+    [string]$MountPathBase64,
+    [string]$AddToPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -97,7 +98,7 @@ function Invoke-ElevatedInstaller {
 	Write-InstallLog -Level INFO -Message 'Launching elevated installer; live child-process log entries will follow.'
     $offset = (Get-Item -LiteralPath $LogFile).Length
     $encodedMountPath = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($MountPath))
-    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-MountPathBase64', $encodedMountPath)
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-MountPathBase64', $encodedMountPath, '-AddToPath', $AddToPath)
     try {
         $process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $arguments -PassThru
     } catch {
@@ -128,6 +129,26 @@ trap {
 }
 
 Write-InstallLog -Level INFO -Message 'Starting installation for RcloneExplorerStatus.'
+
+$PrereqScript = Join-Path $PSScriptRoot 'scripts\install-prereqs.ps1'
+if (-not (Test-Path -LiteralPath $PrereqScript)) {
+    throw "Missing prerequisite helper script: $PrereqScript"
+}
+. $PrereqScript
+
+Assert-WindowsRequirement
+Assert-ArchitectureRequirement
+Assert-GoRequirement
+$ResolvedRclonePath = Ensure-RcloneRequirement
+Ensure-OverlayIcons -RepoRoot ((Resolve-Path (Join-Path $PSScriptRoot '.')).Path)
+
+if ([string]::IsNullOrWhiteSpace($AddToPath)) {
+    $AddToPath = if (Confirm-AddRcsToPath) { 'true' } else { 'false' }
+    Write-InstallLog -Level INFO -Message "User PATH preference for rcs: $AddToPath"
+} else {
+    $AddToPath = $AddToPath.Trim().ToLowerInvariant()
+    Write-InstallLog -Level INFO -Message "Using PATH preference from installer args: $AddToPath"
+}
 
 if (-not [string]::IsNullOrWhiteSpace($MountPathBase64)) {
     try {
@@ -163,7 +184,16 @@ if (-not (Test-Path (Join-Path $RepoRoot 'go.mod'))) {
 
 $VSWhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path $VSWhere)) {
-    throw 'Visual Studio C++ Build Tools were not found. Install Visual Studio 2022 Build Tools with the C++ desktop workload and Windows 10/11 SDK, then rerun install.ps1. See https://visualstudio.microsoft.com/visual-cpp-build-tools/.'
+    $choice = Show-RequirementPrompt -Title 'Visual Studio Build Tools required' -Message @"
+Visual Studio 2022 Build Tools with the C++ workload are required to build the Explorer overlay DLL.
+
+Yes = open the Visual C++ Build Tools download page
+No/Cancel = abort installation
+"@
+    if ($choice -eq 'Yes') {
+        Start-Process 'https://visualstudio.microsoft.com/visual-cpp-build-tools/'
+    }
+    throw 'Visual Studio C++ Build Tools were not found. Install Build Tools with the C++ desktop workload and Windows SDK, then rerun install.ps1.'
 }
 
 Write-InstallLog -Level INFO -Message "Searching for installed Visual Studio instances with $VSWhere"
@@ -255,6 +285,8 @@ New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
 $BinaryPath = Join-Path $BinDir 'rclone-explorer-status.exe'
 $MonitorPath = Join-Path $BinDir 'rclone-explorer-status-monitor.exe'
 $InstallerPath = Join-Path $BinDir 'rclone-explorer-status-installer.exe'
+$ShellHelperPath = Join-Path $BinDir 'rclone-explorer-status-shell.exe'
+$AppPath = Join-Path $BinDir 'rclone-explorer-status-app.exe'
 $OverlayPath = Join-Path $BinDir 'RcloneOverlay.dll'
 $AssetsDir = Join-Path $InstallRoot 'assets'
 
@@ -280,6 +312,16 @@ try {
         throw 'Building the GUI installer failed.'
     }
     Write-InstallLog -Level INFO -Message 'Go installer build completed.'
+    Invoke-LoggedInstallCommand -Executable 'go' -Arguments @('build', '-ldflags', '-H=windowsgui', '-o', $ShellHelperPath, '.\cmd\shellhelper') -Description 'Explorer shell helper build'
+    if (-not (Test-Path $ShellHelperPath)) {
+        throw 'Building the Explorer shell helper failed.'
+    }
+    Write-InstallLog -Level INFO -Message 'Explorer shell helper build completed.'
+    Invoke-LoggedInstallCommand -Executable 'go' -Arguments @('build', '-ldflags', '-H=windowsgui', '-o', $AppPath, '.\cmd\app') -Description 'Start Menu app build'
+    if (-not (Test-Path $AppPath)) {
+        throw 'Building the Start Menu app failed.'
+    }
+    Write-InstallLog -Level INFO -Message 'Start Menu app build completed.'
     Invoke-LoggedInstallCommand -Executable $MSBuildPath -Arguments @($OverlayProject, '/m', '/p:Configuration=Release', '/p:Platform=x64', "/p:OutDir=$BinDir/") -Description 'Native Explorer COM handler build'
     if (-not (Test-Path $OverlayPath)) {
         throw 'Building the native Explorer COM handler failed.'
@@ -309,9 +351,34 @@ if ($installerExitCode -ne 0) {
 }
 Write-InstallLog -Level INFO -Message 'Mount folder selection and config write completed.'
 
+# Persist the discovered rclone executable into the user config.
+$configPath = Join-Path $ConfigDir 'config.json'
+if (Test-Path -LiteralPath $configPath) {
+    try {
+        $configObject = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        if (-not $configObject.rclone) { $configObject | Add-Member -NotePropertyName rclone -NotePropertyValue ([pscustomobject]@{}) }
+        $configObject.rclone.executable = $ResolvedRclonePath
+        Write-JsonNoBom -Path $configPath -Object $configObject
+        Write-InstallLog -Level INFO -Message "Saved rclone executable path to config: $ResolvedRclonePath"
+    } catch {
+        Write-InstallLog -Level WARN -Message "Could not persist rclone path into config.json: $($_.Exception.Message)"
+    }
+}
+
 $RegSvr32 = Join-Path $env:WINDIR 'System32\regsvr32.exe'
 Invoke-LoggedInstallCommand -Executable $RegSvr32 -Arguments @('/s', $OverlayPath) -Description 'Explorer COM handler registration'
 Write-InstallLog -Level INFO -Message 'Explorer COM overlay handlers registered.'
+
+Register-ExplorerContextMenus -ShellHelperPath $ShellHelperPath -IconPath (Join-Path $AssetsDir 'synced.ico')
+Install-StartMenuShortcuts -AppExe $AppPath -CliExe $BinaryPath -InstallRoot $InstallRoot
+
+$RcsPath = Install-RcsShim -BinDir $BinDir -CliExe $BinaryPath
+Save-InstallBinPath -ConfigPath (Join-Path $ConfigDir 'config.json') -BinDir $BinDir
+if ($AddToPath -eq 'true') {
+    Add-BinDirToUserPath -BinDir $BinDir
+} else {
+    Write-InstallLog -Level INFO -Message "Skipped adding $BinDir to user PATH (user chose No)."
+}
 
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 New-Item -Path $RunKey -Force | Out-Null
@@ -320,7 +387,16 @@ Write-InstallLog -Level INFO -Message "Registered background monitor to start at
 
 Write-InstallLog -Level INFO -Message "Installation complete. Application root: $InstallRoot"
 Write-Host 'Installation complete.'
-Write-Host "Binary: $BinaryPath"
+Write-Host "App: $AppPath"
+Write-Host "CLI: $BinaryPath"
+Write-Host "Short command: $RcsPath  (use: rcs remaining)"
+Write-Host "Shell helper (right-click Sync/Audit): $ShellHelperPath"
 Write-Host "Config: $(Join-Path $ConfigDir 'config.json')"
 Write-Host "Log: $LogFile"
-Write-Host 'Restart Windows Explorer before testing overlays; start rclone with the loopback RC flags described in INSTALLATION.md for automatic status updates.'
+if ($AddToPath -eq 'true') {
+    Write-Host "PATH updated. Open a new terminal, then run: rcs remaining"
+} else {
+    Write-Host "PATH was not changed. Call the full CLI path, or rerun install and choose Yes for PATH."
+}
+Write-Host 'Open Start Menu > Rclone Explorer Status, or right-click a mount file and choose Sync with Rclone Explorer Status.'
+Write-Host 'Restart Windows Explorer before testing overlays; start rclone with loopback RC flags for automatic status updates.'

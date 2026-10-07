@@ -6,3 +6,7 @@ state.json
 *.log
 /.idea/
 /.vscode/
+/bin/
+/dist/
+SUMMARY.md
+prd.md

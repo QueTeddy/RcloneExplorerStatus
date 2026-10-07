@@ -4,11 +4,16 @@ This project includes a native COM overlay handler, a Go status service, and a W
 
 ## Prerequisites
 
-- Windows 10 or Windows 11
+`install.ps1` validates these and prompts when something is missing:
+
+- Windows 10 or Windows 11 (amd64)
 - Go 1.26 or later
 - PowerShell 5.1 or PowerShell 7+
 - Visual Studio 2022 Build Tools with the C++ desktop workload and a Windows 10/11 SDK
-- rclone already mounting the S3 remote to a local drive or directory
+- rclone on PATH or in a common install location (installer can run `winget install Rclone.Rclone` or open the download page)
+- overlay icons under `assets\` (generated automatically with Python if missing)
+
+rclone should already mount the remote to a local drive or directory before you select that path in the installer.
 
 ## Build steps
 
@@ -19,12 +24,16 @@ go test ./...
 go build ./...
 ```
 
-To build both executables into `bin` manually:
+To build the main executables into `bin` manually:
 
 ```powershell
 New-Item -ItemType Directory -Force .\bin | Out-Null
 go build -o .\bin\rclone-explorer-status.exe .\cmd\service
+go build -ldflags '-H=windowsgui' -o .\bin\rclone-explorer-status-monitor.exe .\cmd\service
 go build -ldflags '-H=windowsgui' -o .\bin\rclone-explorer-status-installer.exe .\cmd\installer
+go build -ldflags '-H=windowsgui' -o .\bin\rclone-explorer-status-shell.exe .\cmd\shellhelper
+go build -ldflags '-H=windowsgui' -o .\bin\rclone-explorer-status-app.exe .\cmd\app
+Copy-Item .\bin\rclone-explorer-status.exe .\bin\rcs.exe -Force
 ```
 
 ## Install the application
@@ -37,20 +46,31 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 The script will:
 
-1. open the folder picker in your current user session before requesting UAC, so mapped drives such as `S:\` remain visible
-2. preselect the first available non-system filesystem drive when possible
-3. request administrator permission for machine-wide COM registration and pass the selected mount path to the elevated process
-4. create the application directory
-5. build the Go CLI, hidden background monitor, GUI installer, and x64 native COM DLL
-6. install overlay icons
-7. save the selected folder in `%APPDATA%\RcloneExplorerStatus\config.json`
-8. register the three prioritized overlay COM classes and notify Explorer
-9. start the monitor in the current user session and register it to start at sign-in
-10. write a detailed install log
+1. validate Windows / architecture / Go / VS C++ tools / rclone / icons (prompting to install or open download pages when needed)
+2. ask whether to add the short **`rcs`** command to your user PATH
+3. open the folder picker in your current user session before requesting UAC, so mapped drives such as `S:\` remain visible
+4. request administrator permission for machine-wide COM registration and pass the selected mount path to the elevated process
+5. create the application directory
+6. build the Go CLI (`rclone-explorer-status.exe` + `rcs`), hidden monitor, shell helper, Start Menu app, GUI installer, and x64 native COM DLL
+7. install overlay icons
+8. save the selected folder and rclone path in `%APPDATA%\RcloneExplorerStatus\config.json`
+9. register the three prioritized overlay COM classes and notify Explorer
+10. register Explorer right-click Sync / Audit verbs and Start Menu shortcuts
+11. optionally add the install `bin` folder to your user PATH
+12. start the monitor in the current user session and register it to start at sign-in
+13. write a detailed install log
 
 Select the mounted S3 drive or directory, for example `S:\`. Do not select the application install directory. The mount must already exist and be accessible in the current user session when selected. The elevated stage uses the saved path and does not reopen the folder picker.
 
-After installation, restart Windows Explorer (Task Manager > Windows Explorer > Restart) so it reloads the newly registered handlers.
+After installation:
+
+- restart Windows Explorer (Task Manager > Windows Explorer > Restart) so it reloads shell handlers
+- open a **new** terminal (PowerShell, cmd, or Git Bash) so `rcs` is on PATH
+
+```bash
+rcs doctor
+rcs remaining
+```
 
 ## Default install locations
 

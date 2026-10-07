@@ -19,8 +19,10 @@ func ForState(current status.State) Overlay {
 		return OverlaySyncing
 	case status.StateError:
 		return OverlayError
-	case status.StatePending, status.StateConflict:
+	case status.StatePending:
 		return OverlaySyncing
+	case status.StateConflict:
+		return OverlayError
 	default:
 		return OverlayNone
 	}

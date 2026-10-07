@@ -179,6 +179,32 @@ trap {
 Write-UninstallLog -Level INFO -Message 'Starting RcloneExplorerStatus uninstall.'
 $RebootRequired = $false
 
+$PrereqScript = Join-Path $PSScriptRoot 'scripts\install-prereqs.ps1'
+if (Test-Path -LiteralPath $PrereqScript) {
+    . $PrereqScript
+    function Write-InstallLog {
+        param([string]$Level, [string]$Message)
+        Write-UninstallLog -Level $Level -Message $Message
+    }
+    Unregister-ExplorerContextMenus
+    Remove-StartMenuShortcuts
+    foreach ($candidate in @(
+        (Join-Path $env:ProgramFiles 'RcloneExplorerStatus\bin'),
+        (Join-Path $env:LOCALAPPDATA 'RcloneExplorerStatus\bin')
+    )) {
+        if (Test-Path -LiteralPath $candidate) {
+            Remove-BinDirFromUserPath -BinDir $candidate
+        }
+    }
+    Write-UninstallLog -Level INFO -Message 'Removed Explorer context menus, Start Menu shortcuts, and rcs PATH entries.'
+} else {
+    try { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree('Software\Classes\*\shell\RcloneExplorerStatus.Sync', $false) } catch {}
+    try { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree('Software\Classes\Directory\shell\RcloneExplorerStatus.Audit', $false) } catch {}
+    Remove-Item -Path (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Rclone Explorer Status') -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Rclone Explorer Status') -Recurse -Force -ErrorAction SilentlyContinue
+    Write-UninstallLog -Level WARN -Message 'Prerequisite helper missing; performed best-effort context-menu/Start Menu cleanup.'
+}
+
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 if (Test-Path $RunKey) {
     Remove-ItemProperty -Path $RunKey -Name $AppName -ErrorAction SilentlyContinue

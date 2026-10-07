@@ -64,12 +64,41 @@ func execCommand(ctx context.Context, executable string, args ...string) ([]byte
 	return output, err
 }
 
-func AuditFolder(ctx context.Context, executable, remoteRoot, mountPath string) ([]InventoryItem, error) {
-	remoteFiles, err := ListRemoteFiles(ctx, executable, remoteRoot)
+// AuditFolder compares local mount files under optional folderPath with the
+// remote via rclone lsjson. folderPath may be empty (whole mount), a path under
+// the mount, or a mount-relative folder. No direct S3 API is used.
+func AuditFolder(ctx context.Context, executable, remoteRoot, mountPath, folderPath string) ([]InventoryItem, error) {
+	folderRel, err := resolveFolderRelative(mountPath, folderPath)
 	if err != nil {
 		return nil, err
 	}
-	return CompareFileSets(mountPath, localFiles(mountPath), remoteFiles)
+
+	localRoot := mountPath
+	if folderRel != "" {
+		localRoot = filepath.Join(mountPath, filepath.FromSlash(folderRel))
+		info, statErr := os.Stat(localRoot)
+		if statErr != nil {
+			return nil, fmt.Errorf("audit folder: %w", statErr)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("audit path must be a folder: %s", localRoot)
+		}
+	}
+
+	remoteTarget := joinRemote(remoteRoot, folderRel)
+	remoteFiles, err := ListRemoteFiles(ctx, executable, remoteTarget)
+	if err != nil {
+		return nil, err
+	}
+	if folderRel != "" {
+		prefixed := make([]string, 0, len(remoteFiles))
+		for _, name := range remoteFiles {
+			prefixed = append(prefixed, normalizeRelative(folderRel+"/"+name))
+		}
+		remoteFiles = prefixed
+	}
+
+	return CompareFileSets(mountPath, localFiles(localRoot, mountPath), remoteFiles)
 }
 
 func CompareFileSets(mountPath string, localFiles, remoteFiles []string) ([]InventoryItem, error) {
@@ -121,7 +150,38 @@ func CompareFileSets(mountPath string, localFiles, remoteFiles []string) ([]Inve
 	return items, nil
 }
 
+// ApplyInventory writes presentation state for local files so Explorer overlays
+// reflect remote existence. Local-only files become error; files on both sides
+// become synced. Cloud-only (remote without local) is skipped for overlays.
+func ApplyInventory(store *status.Store, items []InventoryItem) []string {
+	changed := make([]string, 0, len(items))
+	for _, item := range items {
+		if !item.LocalExists {
+			continue
+		}
+		message := ""
+		state := item.State
+		switch state {
+		case status.StateError:
+			message = "object missing on remote"
+		case status.StateSynced:
+			message = ""
+		case status.StateCloudOnly:
+			continue
+		default:
+			state = status.StateSynced
+		}
+		store.Set(item.LocalPath, state, status.DirectionNone, message)
+		changed = append(changed, item.LocalPath)
+	}
+	return changed
+}
+
 func ResyncMissing(ctx context.Context, executable, remoteRoot, mountPath, localPath string) (string, error) {
+	return resyncMissing(ctx, execCommand, executable, remoteRoot, mountPath, localPath)
+}
+
+func resyncMissing(ctx context.Context, run CommandRunner, executable, remoteRoot, mountPath, localPath string) (string, error) {
 	relative, err := relativeToMount(mountPath, localPath)
 	if err != nil {
 		return "", err
@@ -134,7 +194,7 @@ func ResyncMissing(ctx context.Context, executable, remoteRoot, mountPath, local
 		return "", fmt.Errorf("resync source must be a file: %s", localPath)
 	}
 
-	remoteFiles, err := ListRemoteFiles(ctx, executable, remoteRoot)
+	remoteFiles, err := listRemoteFiles(ctx, run, executable, remoteRoot)
 	if err != nil {
 		return "", err
 	}
@@ -143,11 +203,49 @@ func ResyncMissing(ctx context.Context, executable, remoteRoot, mountPath, local
 		remoteSet[normalizeRelative(file)] = struct{}{}
 	}
 	if _, exists := remoteSet[normalizeRelative(relative)]; exists {
-		return "", fmt.Errorf("S3 object already exists for %s; refusing to overwrite it", relative)
+		return "", fmt.Errorf("remote object already exists for %s; refusing to overwrite it", relative)
 	}
 
-	remoteTarget := strings.TrimRight(remoteRoot, "/") + "/" + filepath.ToSlash(relative)
-	output, err := execCommand(ctx, executable, "copyto", "--ignore-existing", localPath, remoteTarget)
+	remoteTarget := joinRemote(remoteRoot, relative)
+	output, err := run(ctx, executable, "copyto", "--ignore-existing", localPath, remoteTarget)
+	if err != nil {
+		return "", fmt.Errorf("rclone failed to upload missing object %s: %w: %s", relative, err, strings.TrimSpace(string(output)))
+	}
+	return remoteTarget, nil
+}
+
+// ResyncMissingUnder audits folderPath and uploads every local-only file via rclone.
+// It reuses the audit result so each missing file does not re-list the remote.
+func ResyncMissingUnder(ctx context.Context, executable, remoteRoot, mountPath, folderPath string) (uploaded []string, failed map[string]string, err error) {
+	items, err := AuditFolder(ctx, executable, remoteRoot, mountPath, folderPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	failed = map[string]string{}
+	for _, item := range items {
+		if !item.LocalExists || item.RemoteExists {
+			continue
+		}
+		target, resyncErr := uploadMissing(ctx, execCommand, executable, remoteRoot, item.RelativePath, item.LocalPath)
+		if resyncErr != nil {
+			failed[item.LocalPath] = resyncErr.Error()
+			continue
+		}
+		uploaded = append(uploaded, target)
+	}
+	return uploaded, failed, nil
+}
+
+func uploadMissing(ctx context.Context, run CommandRunner, executable, remoteRoot, relative, localPath string) (string, error) {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return "", fmt.Errorf("read local source file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("resync source must be a file: %s", localPath)
+	}
+	remoteTarget := joinRemote(remoteRoot, relative)
+	output, err := run(ctx, executable, "copyto", "--ignore-existing", localPath, remoteTarget)
 	if err != nil {
 		return "", fmt.Errorf("rclone failed to upload missing object %s: %w: %s", relative, err, strings.TrimSpace(string(output)))
 	}
@@ -170,16 +268,42 @@ func relativeToMount(mountPath, filePath string) (string, error) {
 	return filepath.ToSlash(relative), nil
 }
 
-func localFiles(root string) []string {
+func resolveFolderRelative(mountPath, folderPath string) (string, error) {
+	folderPath = strings.TrimSpace(folderPath)
+	if folderPath == "" {
+		return "", nil
+	}
+	cleanMount := filepath.Clean(mountPath)
+	cleanFolder := filepath.Clean(folderPath)
+	if filepath.IsAbs(cleanFolder) || (len(cleanFolder) >= 2 && cleanFolder[1] == ':') {
+		return relativeToMount(cleanMount, cleanFolder)
+	}
+	joined := filepath.Join(cleanMount, cleanFolder)
+	if info, err := os.Stat(joined); err == nil && !info.IsDir() {
+		return "", fmt.Errorf("audit path must be a folder: %s", joined)
+	}
+	return relativeToMount(cleanMount, joined)
+}
+
+func joinRemote(remoteRoot, relative string) string {
+	remoteRoot = strings.TrimRight(strings.TrimSpace(remoteRoot), "/")
+	relative = normalizeRelative(relative)
+	if relative == "" {
+		return remoteRoot
+	}
+	return remoteRoot + "/" + relative
+}
+
+func localFiles(walkRoot, mountRoot string) []string {
 	var files []string
-	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+	_ = filepath.WalkDir(walkRoot, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if entry.IsDir() {
 			return nil
 		}
-		if relative, relErr := filepath.Rel(root, path); relErr == nil {
+		if relative, relErr := filepath.Rel(mountRoot, path); relErr == nil {
 			files = append(files, filepath.ToSlash(relative))
 		}
 		return nil
