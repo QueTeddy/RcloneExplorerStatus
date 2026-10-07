@@ -14,7 +14,7 @@ func TestForStateMapsSupportedStates(t *testing.T) {
 		{state: status.StateSynced, want: OverlaySynced},
 		{state: status.StateSyncing, want: OverlaySyncing},
 		{state: status.StatePending, want: OverlaySyncing},
-		{state: status.StateConflict, want: OverlaySyncing},
+		{state: status.StateConflict, want: OverlayError},
 		{state: status.StateError, want: OverlayError},
 		{state: status.StateUnknown, want: OverlayNone},
 		{state: status.StateOffline, want: OverlayNone},
