@@ -22,6 +22,8 @@ $args = @(
     's3:local-sync-folder-reclone',
     'S:',
     '--vfs-cache-mode', 'full',
+    '--vfs-cache-max-size', '20G',
+    '--s3-chunk-size', '64M',
     '--links',
     '--rc',
     '--rc-addr', '127.0.0.1:5572',
