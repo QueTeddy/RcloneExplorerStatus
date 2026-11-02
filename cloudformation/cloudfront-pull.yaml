@@ -1,0 +1,683 @@
+# Deploy this stack in us-east-1. Lambda@Edge is published from that region,
+# and the bucket local-sync-folder-reclone is there.
+#
+#   aws cloudformation deploy --region us-east-1 --stack-name explorer-status-pull --template-file cloudformation/cloudfront-pull.yaml --capabilities CAPABILITY_NAMED_IAM --parameter-overrides PullKey=PUT_A_LONG_RANDOM_SECRET_HERE
+#
+# BucketName is already set to local-sync-folder-reclone. Pass BucketName only
+# when the pull bucket is a different one. This stack does not create the bucket.
+#
+# The bucket guard merges statements into the existing bucket policy and removes
+# only those statements on delete. It also turns on Block Public Access and,
+# by default, Bucket owner enforced. Uploads, multipart resume, and HeadObject
+# keep working unless DenyDirectGetObject is true.
+#
+# After CREATE_COMPLETE, downloads only:
+#   rclone config update s3 download_url https://DISTRIBUTION.cloudfront.net/
+#   --s3-download-url https://DISTRIBUTION.cloudfront.net/ --header-download "X-Pull-Key: SECRET"
+# Generate the secret with characters from [A-Za-z0-9_-], at least 24 long.
+# Do not commit it. Anyone who can read the viewer-request Lambda can see it.
+#
+# Analytics is one DynamoDB row per GET, including each 128 MB range read.
+# durationMs is how long that response took at the edge, not the length of the
+# file. A watch is the set of rows with the same clientIp and uri: sum bytes,
+# and use the first and last watchedAt as the session. Files larger than 50 GB
+# must be fetched with Range requests; a single full-object GET is rejected
+# while caching is on.
+# If the first deploy fails with "function is not replicated", run the same
+# deploy again. Bump FunctionRevision after any edit to the analytics code.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudFront download path for an existing S3 bucket. Viewer requests must
+  send a shared secret. Each GET is recorded from the edge into DynamoDB.
+  The bucket stays private and can still be updated by the upload policy.
+
+Rules:
+  MustDeployInUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref "AWS::Region", us-east-1]
+        AssertDescription: Deploy this stack in us-east-1.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: local-sync-folder-reclone
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: Existing bucket to pull from. Preset to local-sync-folder-reclone. The stack does not create it.
+  BucketRegion:
+    Type: String
+    Default: us-east-1
+    AllowedPattern: "^[a-z]{2}(-[a-z]+)+-[0-9]+$"
+    Description: Region of that bucket. The origin hostname is built from this.
+  PullKey:
+    Type: String
+    NoEcho: true
+    MinLength: 24
+    MaxLength: 128
+    AllowedPattern: "^[A-Za-z0-9_-]+$"
+    Description: Shared secret rclone sends as X-Pull-Key. Use letters, numbers, underscore, or hyphen. Not stored in stack outputs.
+  PriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues:
+      - PriceClass_100
+      - PriceClass_200
+      - PriceClass_All
+    Description: PriceClass_100 is North America and Europe, which is the cheap set for this pull.
+  CacheDefaultTtlSeconds:
+    Type: Number
+    Default: 86400
+    MinValue: 0
+    MaxValue: 31536000
+    Description: How long CloudFront keeps an object that has no Cache-Control header. Overwrites at the same key need an invalidation.
+  AnalyticsRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+    Description: DynamoDB deletes each view row this many days after it was written. Rows store IP addresses.
+  LogRangeRequests:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: true records every GET, including each range chunk. false records only the opening chunk (bytes=0) plus full-object GETs.
+  FunctionRevision:
+    Type: String
+    Default: "1"
+    AllowedPattern: "^[A-Za-z0-9_.-]{1,32}$"
+    Description: Bump this after editing either edge function, or after changing PullKey, so CloudFront publishes new Lambda versions.
+  DenyDirectGetObject:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      true denies s3:GetObject unless the caller is this distribution. That
+      stops direct S3 downloads and also stops HeadObject, so rclone audit
+      and the mount's file stats break. Leave false.
+  EnforceBucketOwner:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      true sets Object Ownership to Bucket owner enforced, which origin access
+      control needs when the bucket still uses ACLs. ACLs are then disabled.
+      The stack delete does not turn them back on.
+  UploaderUserName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[\\w+=,.@-]{1,64}$"
+    Description: >
+      Optional IAM user that receives the update-and-protect policy. Leave
+      this empty when that user is also the principal deploying this stack.
+      The policy denies bucket-policy, ACL, encryption, versioning, and
+      public-access changes, so an attached deployer cannot update the stack.
+
+Conditions:
+  HasUploader: !Not [!Equals [!Ref UploaderUserName, ""]]
+
+Resources:
+  PullCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${AWS::StackName}-pull-cache"
+        Comment: Cache object bytes only. Do not add x-watch-start or X-Pull-Key to this key.
+        DefaultTTL: !Ref CacheDefaultTtlSeconds
+        MaxTTL: 31536000
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  PullOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-pull-oac"
+        Description: !Sub "Sign S3 reads for ${BucketName}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  PullAuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: auth-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  PullAuthFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "rev ${FunctionRevision}. Rejects pulls that omit X-Pull-Key."
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 5
+      Role: !GetAtt PullAuthRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import time
+          # publish ${FunctionRevision}
+          KEY = "${PullKey}"
+
+          def hv(headers, name):
+              h = headers.get(name)
+              if not h:
+                  return ""
+              if isinstance(h, list):
+                  return h[0].get("value", "") if h else ""
+              return h.get("value", "") if isinstance(h, dict) else ""
+
+          def handler(event, context):
+              request = event["Records"][0]["cf"]["request"]
+              headers = request.setdefault("headers", {})
+              if hv(headers, "x-pull-key") != KEY:
+                  return {
+                      "status": "403",
+                      "statusDescription": "Forbidden",
+                      "headers": {
+                          "cache-control": [{"key": "Cache-Control", "value": "no-store"}],
+                          "content-type": [{"key": "Content-Type", "value": "text/plain"}],
+                      },
+                      "body": "Forbidden",
+                  }
+              headers.pop("x-pull-key", None)
+              headers["x-watch-start"] = [{"key": "X-Watch-Start", "value": str(time.time())}]
+              return request
+
+  PullAuthVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref PullAuthFunction
+      Description: !Sub "rev-${FunctionRevision}"
+
+  PullAuthPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PullAuthFunction
+      Principal: edgelambda.amazonaws.com
+
+  PullAnalyticsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-views"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: ipKey
+          AttributeType: S
+        - AttributeName: objectKey
+          AttributeType: S
+        - AttributeName: watchedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: IpIndex
+          KeySchema:
+            - AttributeName: ipKey
+              KeyType: HASH
+            - AttributeName: watchedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ObjectIndex
+          KeySchema:
+            - AttributeName: objectKey
+              KeyType: HASH
+            - AttributeName: watchedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - Key: Purpose
+          Value: pull-analytics
+
+  PullAnalyticsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-views
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt PullAnalyticsTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  PullAnalyticsFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "rev ${FunctionRevision}. Records CloudFront GETs for ${BucketName}."
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 5
+      Role: !GetAtt PullAnalyticsRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import time, urllib.parse, boto3
+          from botocore.config import Config
+          # publish ${FunctionRevision}
+          DAYS = int("${AnalyticsRetentionDays}")
+          LOG_RANGES = "${LogRangeRequests}"
+          _ddb = None
+
+          def hv(headers, name):
+              h = headers.get(name)
+              if not h:
+                  return ""
+              if isinstance(h, list):
+                  return h[0].get("value", "") if h else ""
+              return h.get("value", "") if isinstance(h, dict) else ""
+
+          def add(item, key, val, limit=500):
+              if val:
+                  item[key] = {"S": val[:limit]}
+
+          def handler(event, context):
+              global _ddb
+              cf = event["Records"][0]["cf"]
+              req = cf["request"]
+              res = cf["response"]
+              try:
+                  if req.get("method") != "GET":
+                      return res
+                  rh = req.get("headers") or {}
+                  sh = res.get("headers") or {}
+                  rng = hv(rh, "range")
+                  if LOG_RANGES != "true" and rng and not rng.startswith("bytes=0-") and not rng.startswith("bytes=0,"):
+                      return res
+                  if _ddb is None:
+                      _ddb = boto3.client("dynamodb", region_name="us-east-1", config=Config(connect_timeout=1, read_timeout=1, retries={"max_attempts": 1}))
+                  uri = urllib.parse.unquote(req.get("uri") or "/")
+                  if uri.startswith("/"):
+                      uri = uri[1:]
+                  now = time.time()
+                  ip = req.get("clientIp") or "-"
+                  stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + ".%03dZ" % int((now % 1) * 1000)
+                  rid = getattr(context, "aws_request_id", "na").replace("-", "")[:16]
+                  item = {
+                      "pk": {"S": "DAY#" + stamp[:10]},
+                      "sk": {"S": stamp + "#" + rid},
+                      "ipKey": {"S": ip},
+                      "objectKey": {"S": uri[:900]},
+                      "watchedAt": {"S": stamp},
+                      "clientIp": {"S": ip},
+                      "uri": {"S": uri[:1024]},
+                      "expiresAt": {"N": str(int(now) + DAYS * 86400)},
+                  }
+                  add(item, "method", req.get("method"), 8)
+                  add(item, "status", str(res.get("status", "")), 4)
+                  add(item, "userAgent", hv(rh, "user-agent"), 400)
+                  add(item, "country", hv(rh, "cloudfront-viewer-country"), 8)
+                  add(item, "region", hv(rh, "cloudfront-viewer-country-region"), 32)
+                  add(item, "city", hv(rh, "cloudfront-viewer-city"), 80)
+                  add(item, "referer", hv(rh, "referer"), 300)
+                  add(item, "rangeRequest", rng, 120)
+                  add(item, "bytes", hv(sh, "content-length"), 20)
+                  add(item, "contentRange", hv(sh, "content-range"), 80)
+                  add(item, "cache", hv(sh, "x-cache"), 80)
+                  started = hv(rh, "x-watch-start")
+                  if started:
+                      dur = int((now - float(started)) * 1000)
+                      item["durationMs"] = {"N": str(0 if dur < 0 else dur)}
+                  _ddb.put_item(TableName="${PullAnalyticsTable}", Item=item)
+              except Exception as exc:
+                  print("analytics write failed: " + str(exc)[:300])
+              return res
+
+  PullAnalyticsVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref PullAnalyticsFunction
+      Description: !Sub "rev-${FunctionRevision}-ttl-${AnalyticsRetentionDays}-ranges-${LogRangeRequests}"
+
+  PullAnalyticsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PullAnalyticsFunction
+      Principal: edgelambda.amazonaws.com
+
+  EdgeWaitRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  EdgeWaitFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-edge-wait"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 128
+      Role: !GetAtt EdgeWaitRole.Arn
+      Code:
+        ZipFile: |
+          import json, time, urllib3
+          http = urllib3.PoolManager()
+
+          def handler(event, context):
+              status = "SUCCESS"
+              reason = "ok"
+              try:
+                  if event["RequestType"] != "Delete":
+                      time.sleep(60)
+              except Exception as exc:
+                  status = "FAILED"
+                  reason = str(exc)[:300]
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason,
+                  "PhysicalResourceId": "edge-wait",
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              http.request("PUT", event["ResponseURL"], body=body, headers={"content-type": ""})
+
+  EdgeWait:
+    Type: Custom::EdgeWait
+    DependsOn:
+      - PullAnalyticsPermission
+      - PullAuthPermission
+    Properties:
+      ServiceToken: !GetAtt EdgeWaitFunction.Arn
+      VersionArn: !Ref PullAnalyticsVersion
+      AuthVersionArn: !Ref PullAuthVersion
+
+  PullDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: EdgeWait
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "Pull cache for ${BucketName}"
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        Origins:
+          - Id: s3-pull-origin
+            DomainName: !Sub "${BucketName}.s3.${BucketRegion}.amazonaws.com"
+            OriginAccessControlId: !GetAtt PullOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: s3-pull-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: false
+          CachePolicyId: !Ref PullCachePolicy
+          LambdaFunctionAssociations:
+            - EventType: viewer-request
+              IncludeBody: false
+              LambdaFunctionARN: !Ref PullAuthVersion
+            - EventType: viewer-response
+              IncludeBody: false
+              LambdaFunctionARN: !Ref PullAnalyticsVersion
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  BucketGuardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: guard-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:PutBucketOwnershipControls
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}"
+                  - !Sub "arn:aws:s3:::${BucketName}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+  BucketGuardFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-bucket-guard"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt BucketGuardRole.Arn
+      Code:
+        ZipFile: |
+          import json, urllib3, boto3
+          from botocore.exceptions import ClientError
+          http = urllib3.PoolManager()
+          OWNED = {"AllowCfRead","DenyHttp","DenyCannedAcl","DenyGrantRead","DenyGrantWrite","DenyGrantFull","DenyOtherGet","DenyAnonGet"}
+          def send(e, c, status, reason):
+            b = json.dumps({"Status": status, "Reason": str(reason)[:400], "PhysicalResourceId": e.get("PhysicalResourceId") or "guard-" + e["ResourceProperties"]["BucketName"], "StackId": e["StackId"], "RequestId": e["RequestId"], "LogicalResourceId": e["LogicalResourceId"], "Data": {}}).encode()
+            http.request("PUT", e["ResponseURL"], body=b, headers={"content-type": ""})
+          def load(s3, bucket, owner):
+            try:
+              return json.loads(s3.get_bucket_policy(Bucket=bucket, ExpectedBucketOwner=owner)["Policy"])
+            except ClientError as ex:
+              if ex.response["Error"]["Code"] == "NoSuchBucketPolicy":
+                return {"Version": "2012-10-17", "Statement": []}
+              raise
+          def stmts(doc):
+            s = doc.get("Statement", [])
+            return s if isinstance(s, list) else [s]
+          def save(s3, bucket, owner, doc, kept):
+            if not kept:
+              try:
+                s3.delete_bucket_policy(Bucket=bucket, ExpectedBucketOwner=owner)
+              except ClientError as ex:
+                if ex.response["Error"]["Code"] != "NoSuchBucketPolicy":
+                  raise
+              return
+            doc["Version"] = "2012-10-17"
+            doc["Statement"] = kept
+            s3.put_bucket_policy(Bucket=bucket, ExpectedBucketOwner=owner, Policy=json.dumps(doc))
+          def wanted(bucket, dist, deny):
+            res = "arn:aws:s3:::%s/*" % bucket
+            bkt = "arn:aws:s3:::%s" % bucket
+            pub = ["public-read", "public-read-write", "authenticated-read"]
+            out = [
+              {"Sid": "AllowCfRead", "Effect": "Allow", "Principal": {"Service": "cloudfront.amazonaws.com"}, "Action": "s3:GetObject", "Resource": res, "Condition": {"StringEquals": {"AWS:SourceArn": dist}}},
+              {"Sid": "DenyHttp", "Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": [bkt, res], "Condition": {"Bool": {"aws:SecureTransport": "false"}}},
+              {"Sid": "DenyCannedAcl", "Effect": "Deny", "Principal": "*", "Action": ["s3:PutObject", "s3:PutObjectAcl", "s3:PutBucketAcl"], "Resource": [bkt, res], "Condition": {"StringEquals": {"s3:x-amz-acl": pub}}},
+            ]
+            for sid, key in (("DenyGrantRead", "s3:x-amz-grant-read"), ("DenyGrantWrite", "s3:x-amz-grant-write"), ("DenyGrantFull", "s3:x-amz-grant-full-control")):
+              out.append({"Sid": sid, "Effect": "Deny", "Principal": "*", "Action": ["s3:PutObject", "s3:PutObjectAcl", "s3:PutBucketAcl"], "Resource": [bkt, res], "Condition": {"StringLike": {key: ["*AllUsers*", "*AuthenticatedUsers*"]}}})
+            if deny:
+              out.append({"Sid": "DenyAnonGet", "Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": res, "Condition": {"Null": {"AWS:SourceArn": "true"}}})
+              out.append({"Sid": "DenyOtherGet", "Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": res, "Condition": {"StringNotEquals": {"AWS:SourceArn": dist}}})
+            return out
+          def handler(event, context):
+            p = event["ResourceProperties"]
+            bucket = p["BucketName"]
+            owner = p["AccountId"]
+            s3 = boto3.client("s3", region_name=p["BucketRegion"])
+            try:
+              if event["RequestType"] != "Delete":
+                s3.put_public_access_block(Bucket=bucket, ExpectedBucketOwner=owner, PublicAccessBlockConfiguration={"BlockPublicAcls": True, "IgnorePublicAcls": True, "BlockPublicPolicy": True, "RestrictPublicBuckets": True})
+                if str(p.get("EnforceOwner", "true")).lower() == "true":
+                  s3.put_bucket_ownership_controls(Bucket=bucket, ExpectedBucketOwner=owner, OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]})
+              doc = load(s3, bucket, owner)
+              kept = [s for s in stmts(doc) if s.get("Sid") not in OWNED]
+              if event["RequestType"] != "Delete":
+                kept.extend(wanted(bucket, p["DistributionArn"], str(p.get("DenyDirectGet", "false")).lower() == "true"))
+              save(s3, bucket, owner, doc, kept)
+              send(event, context, "SUCCESS", "ok")
+            except Exception as ex:
+              send(event, context, "FAILED", ex)
+
+  BucketGuard:
+    Type: Custom::BucketGuard
+    Properties:
+      ServiceToken: !GetAtt BucketGuardFunction.Arn
+      BucketName: !Ref BucketName
+      BucketRegion: !Ref BucketRegion
+      AccountId: !Ref AWS::AccountId
+      DistributionArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${PullDistribution}"
+      DenyDirectGet: !Ref DenyDirectGetObject
+      EnforceOwner: !Ref EnforceBucketOwner
+
+  UploaderPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-bucket-updater"
+      Description: !Sub "Upload and delete objects in ${BucketName}. Cannot change the bucket policy, ACLs, encryption, versioning, or public access."
+      Users: !If
+        - HasUploader
+        - - !Ref UploaderUserName
+        - !Ref AWS::NoValue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: UpdateBucket
+            Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+            Resource: !Sub "arn:aws:s3:::${BucketName}"
+          - Sid: UpdateObjects
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+            Resource: !Sub "arn:aws:s3:::${BucketName}/*"
+          - Sid: ProtectBucket
+            Effect: Deny
+            Action:
+              - s3:DeleteBucket
+              - s3:PutBucketAcl
+              - s3:PutObjectAcl
+              - s3:PutBucketPolicy
+              - s3:DeleteBucketPolicy
+              - s3:PutBucketPublicAccessBlock
+              - s3:PutBucketOwnershipControls
+              - s3:PutEncryptionConfiguration
+              - s3:PutBucketVersioning
+            Resource:
+              - !Sub "arn:aws:s3:::${BucketName}"
+              - !Sub "arn:aws:s3:::${BucketName}/*"
+          - Sid: ProtectAccountPublicAccess
+            Effect: Deny
+            Action: s3:PutAccountPublicAccessBlock
+            Resource: "*"
+
+Outputs:
+  DownloadUrl:
+    Description: rclone download_url. The trailing slash is required. Uploads stay on the S3 API.
+    Value: !Sub "https://${PullDistribution.DomainName}/"
+  DistributionId:
+    Description: Use this for invalidation after an object is overwritten at the same key.
+    Value: !Ref PullDistribution
+  PullHeader:
+    Description: Header name the viewer-request Lambda expects. The value is the PullKey parameter.
+    Value: X-Pull-Key
+  AnalyticsTable:
+    Description: >
+      View rows. pk DAY#yyyy-mm-dd lists a day. IpIndex key ipKey is the client
+      IP and watchedAt is when. ObjectIndex key objectKey is the S3 key.
+      durationMs is that response only. expiresAt is the TTL.
+    Value: !Ref PullAnalyticsTable
+  UpdaterPolicyArn:
+    Description: Attach this to a dedicated upload user, not to the user that deploys the stack.
+    Value: !Ref UploaderPolicy
