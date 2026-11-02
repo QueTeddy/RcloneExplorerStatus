@@ -129,6 +129,8 @@ The Go app never talks to S3 directly and never stores AWS credentials.
 
 ## More detail
 
+See [INNER-WORKINGS.md](INNER-WORKINGS.md) for the blog-style walkthrough: the mount, the VFS cache, the status poll, the overlay DLL, and the limits.
+
 See [INSTALLATION.md](INSTALLATION.md) for prerequisites, Build Tools troubleshooting, and verification steps.
 
 ## Requirements and limitations
